@@ -6,8 +6,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import time
+import re
 from bs4 import BeautifulSoup
-from database import init_db, insert_or_update_architect, export_to_csv
+from database import init_db, insert_architect_row, export_to_excel
 
 def create_driver():
     """Chromeドライバーを作成"""
@@ -44,14 +45,12 @@ def search_and_get_links(driver, url: str, search_number: str) -> list:
     print("⏳ 検索結果を待機中...")
     time.sleep(5)
 
-    # 件数を確認
     try:
         result_count_elem = driver.find_element(By.XPATH, "//*[contains(text(), '件数')]")
         print(f"📊 {result_count_elem.text}")
     except:
         pass
 
-    # 登録番号列のリンクを全て取得
     links = []
     link_elements = driver.find_elements(By.CSS_SELECTOR, "td.link3 a[target='_blank']")
     
@@ -66,144 +65,228 @@ def search_and_get_links(driver, url: str, search_number: str) -> list:
 def extract_text_from_section(soup, section_title: str) -> str:
     """セクションタイトルから対応するテキストを抽出"""
     try:
-        # h3タグでセクションタイトルを探す
-        h3_elem = soup.find('h3', class_='text-sm font-semibold text-gray-800', string=lambda text: text and section_title in text)
-        if h3_elem:
-            # 次のpタグからテキストを取得
-            p_elem = h3_elem.find_next('p', class_='mt-1 text-sm text-gray-600')
-            if p_elem:
-                text = p_elem.get_text(strip=True)
-                # ＊＊＊ の場合は空文字に
-                if text == '＊＊＊' or text == '　':
+        li_elements = soup.find_all('li', class_='py-2')
+        
+        for li_elem in li_elements:
+            # h3タグを探す
+            h3_elem = li_elem.find('h3', class_='text-sm')
+            if h3_elem:
+                h3_text = h3_elem.get_text(strip=True)
+                
+                # 完全一致のみ（部分一致を除外）
+                if section_title == h3_text:
+                    # 同じli内のすべてのpタグを取得
+                    p_tags = li_elem.find_all('p')
+                    
+                    # pタグの中身を確認
+                    for p_tag in p_tags:
+                        text = p_tag.get_text(strip=True)
+                        # 空白文字のみスキップ
+                        if text and text != '　':
+                            return text
+                    
+                    # pタグがない場合
                     return ''
-                return text
-    except:
-        pass
+    except Exception as e:
+        print(f"      ⚠️ extract エラー ({section_title}): {str(e)}")
+        import traceback
+        traceback.print_exc()
     return ''
 
-def scrape_detail_page(driver, url: str) -> list:
-    """
-    詳細ページをスクレイピングして建築士情報を取得
-    戻り値: 建築士情報のリスト（管理建築士 + 所属建築士）
-    """
+def extract_name_from_cell(cell):
+    """氏名セルからカナと漢字を抽出"""
+    html = str(cell)
+    parts = re.split(r'<br\s*/?>', html, flags=re.IGNORECASE)
+    
+    clean_parts = []
+    for part in parts:
+        text = re.sub(r'<[^>]+>', '', part).strip()
+        if text:
+            clean_parts.append(text)
+    
+    if len(clean_parts) >= 2:
+        return clean_parts[0], clean_parts[1]
+    elif len(clean_parts) == 1:
+        return clean_parts[0], clean_parts[0]
+    else:
+        return '', ''
+
+def scrape_detail_page(driver, url: str) -> dict:
+    """詳細ページをスクレイピングして情報を取得"""
     print(f"  📖 {url} を開いています...")
     
-    # 新しいタブで開く
     driver.execute_script(f"window.open('{url}', '_blank');")
-    
-    # 新しいタブに切り替え
     driver.switch_to.window(driver.window_handles[-1])
+    time.sleep(5)
     
-    time.sleep(3)
-    
-    # ページをスクロールして遅延読み込みコンテンツを表示
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
-    
-    # タブを切り替えて所属建築士情報を表示
+    # まず確実にtab1をクリックしてページ全体を読み込む
     try:
-        # 所属建築士タブ(#tab5)をクリック
-        driver.execute_script("document.querySelector('a[href=\"#tab5\"]').click();")
+        driver.execute_script("document.querySelector('a[href=\"#tab1\"]').click();")
         time.sleep(3)
+        driver.execute_script("window.scrollTo(0, 500);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
     except:
         pass
     
     soup = BeautifulSoup(driver.page_source, 'html.parser')
+    tab1 = soup.find('div', id='tab1') or soup
     
-    architects = []
+    # デバッグ用：HTMLの一部を出力
+    print("    🔍 HTMLデバッグ:")
+    li_elements = tab1.find_all('li', class_='py-2')
+    for li in li_elements:
+        h3 = li.find('h3')
+        p = li.find('p')
+        if h3 and '事務所所在地' in h3.get_text():
+            h3_text = h3.get_text(strip=True)
+            p_text = p.get_text(strip=True) if p else 'なし'
+            print(f"       {h3_text}: {p_text}")
     
-    # ============================================
-    # 事務所情報（共通）
-    # ============================================
     office_info = {
-        'office_registration_number': extract_text_from_section(soup, '事務所登録番号'),
-        'company_name': extract_text_from_section(soup, '法人名称'),
-        'office_qualification': extract_text_from_section(soup, '事務所資格区分'),
-        'office_name': extract_text_from_section(soup, '事務所名称'),
-        'office_postal_code': extract_text_from_section(soup, '事務所所在地郵便番号'),
-        'office_address': extract_text_from_section(soup, '事務所所在地'),
-        'office_building': extract_text_from_section(soup, '事務所所在地ビル名等'),
-        'office_phone': extract_text_from_section(soup, '事務所電話番号'),
+        '事務所登録番号': extract_text_from_section(tab1, '事務所登録番号'),
+        '事務所資格区分': extract_text_from_section(tab1, '事務所資格区分'),
+        '事務所名称': extract_text_from_section(tab1, '事務所名称'),
+        '事務所所在地郵便番号': extract_text_from_section(tab1, '事務所所在地郵便番号'),
+        '事務所所在地': extract_text_from_section(tab1, '事務所所在地'),
+        '事務所所在地ビル名等': extract_text_from_section(tab1, '事務所所在地ビル名等'),
+        '事務所電話番号': extract_text_from_section(tab1, '事務所電話番号'),
     }
     
-    print(f"    📋 事務所: {office_info['office_name']}")
+    # デバッグ出力
+    print(f"    📝 取得データ:")
+    print(f"       登録番号: {office_info['事務所登録番号']}")
+    print(f"       郵便番号: {office_info['事務所所在地郵便番号']}")
+    print(f"       所在地: {office_info['事務所所在地']}")
+    print(f"       ビル名: {office_info['事務所所在地ビル名等']}")
+    print(f"       電話: {office_info['事務所電話番号']}")
     
-    # ============================================
-    # 管理建築士情報 (#tab4)
-    # ============================================
-    # tab4の内容を探す
+    # tab2（申請者情報）
+    try:
+        driver.execute_script("document.querySelector('a[href=\"#tab2\"]').click();")
+        time.sleep(2)
+    except:
+        pass
+    
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
+    tab2 = soup.find('div', id='tab2') or soup
+    office_info['法人名称'] = extract_text_from_section(tab2, '法人名称')
+    
+    print(f"    🏢 {office_info['事務所名称']}")
+    
+    # tab4（管理建築士情報）
+    try:
+        driver.execute_script("document.querySelector('a[href=\"#tab4\"]').click();")
+        time.sleep(3)  # 待機時間を延長
+        driver.execute_script("window.scrollTo(0, 500);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+    except:
+        pass
+    
+    # tab4のHTMLを再取得
+    soup = BeautifulSoup(driver.page_source, 'html.parser')
     tab4 = soup.find('div', id='tab4')
+    
+    managing_architect = None
     if tab4:
         managing_architect = office_info.copy()
         managing_architect.update({
-            'architect_name_kana': extract_text_from_section(tab4, '建築士氏名フリガナ'),
-            'architect_name': extract_text_from_section(tab4, '建築士氏名'),
-            'architect_category': extract_text_from_section(tab4, '建築士区分'),
-            'architect_registration_number': extract_text_from_section(tab4, '建築士登録番号'),
-            'registration_prefecture': extract_text_from_section(tab4, '登録を受けた都道府県名'),
-            'is_managing_architect': True
+            '建築士氏名フリガナ': extract_text_from_section(tab4, '建築士氏名フリガナ'),
+            '建築士氏名': extract_text_from_section(tab4, '建築士氏名'),
+            '建築士区分': extract_text_from_section(tab4, '建築士区分'),
+            '建築士登録番号': extract_text_from_section(tab4, '建築士登録番号'),
+            '登録を受けた都道府県名': extract_text_from_section(tab4, '登録を受けた都道府県名'),
         })
         
-        if managing_architect.get('architect_name'):
-            architects.append(managing_architect)
-            print(f"    ✓ 管理建築士: {managing_architect['architect_name']} ({managing_architect['architect_category']})")
+        if managing_architect.get('建築士氏名'):
+            print(f"    ✓ 管理: {managing_architect['建築士氏名']} ({managing_architect.get('建築士登録番号', '')})")
     
-    # ============================================
-    # 所属建築士情報 (#tab5)
-    # ============================================
-    # もう一度スクロールして確実に読み込む
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
+    # tab5（所属建築士情報）
+    try:
+        driver.execute_script("document.querySelector('a[href=\"#tab5\"]').click();")
+        time.sleep(3)  # 待機時間を延長
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+    except:
+        pass
     
-    # 最新のHTMLを取得
+    # tab5のHTMLを再取得
     soup = BeautifulSoup(driver.page_source, 'html.parser')
-    
-    # tab5の内容を探す
     tab5 = soup.find('div', id='tab5')
+    
+    affiliate_architects = []
     if tab5:
-        # テーブルから所属建築士を抽出
-        # Livewireで動的に読み込まれるため、テーブル構造を探す
         tables = tab5.find_all('table')
+        
         for table in tables:
-            rows = table.find_all('tr')
-            for row in rows[1:]:  # ヘッダー行をスキップ
+            tbody = table.find('tbody')
+            if not tbody:
+                continue
+                
+            rows = tbody.find_all('tr')
+            
+            for row in rows:
                 cells = row.find_all('td')
-                if len(cells) >= 5:  # 十分な列数がある場合
+                if len(cells) >= 3:
                     try:
                         architect = office_info.copy()
                         
-                        # テーブルの列からデータを抽出
-                        # 通常: フリガナ, 氏名, 区分, 登録番号, 都道府県
+                        first_cell_text = cells[0].get_text(strip=True)
+                        
+                        if first_cell_text.isdigit():
+                            name_cell = cells[1]
+                            category_cell = cells[2]
+                            reg_num_cell = cells[3] if len(cells) > 3 else None
+                        else:
+                            name_cell = cells[0]
+                            category_cell = cells[1]
+                            reg_num_cell = cells[2] if len(cells) > 2 else None
+                        
+                        name_kana, name_kanji = extract_name_from_cell(name_cell)
+                        
+                        category_html = str(category_cell)
+                        category_parts = re.split(r'<br\s*/?>', category_html, flags=re.IGNORECASE)
+                        category_clean = []
+                        for part in category_parts:
+                            text = re.sub(r'<[^>]+>', '', part).strip()
+                            if text:
+                                category_clean.append(text)
+                        
+                        category = category_clean[0] if category_clean else ''
+                        registration_pref = category_clean[1] if len(category_clean) > 1 else ''
+                        
+                        reg_number = reg_num_cell.get_text(strip=True) if reg_num_cell else ''
+                        if reg_number in ['＊＊＊', '　']:
+                            reg_number = ''
+                        
                         architect.update({
-                            'architect_name_kana': cells[0].get_text(strip=True),
-                            'architect_name': cells[1].get_text(strip=True),
-                            'architect_category': cells[2].get_text(strip=True),
-                            'architect_registration_number': cells[3].get_text(strip=True),
-                            'registration_prefecture': cells[4].get_text(strip=True) if len(cells) > 4 else '',
-                            'is_managing_architect': False
+                            '建築士氏名フリガナ': name_kana,
+                            '建築士氏名': name_kanji,
+                            '建築士区分': category,
+                            '建築士登録番号': reg_number,
+                            '登録を受けた都道府県名': registration_pref,
                         })
                         
-                        # ＊＊＊を空文字に変換
-                        for key in architect:
-                            if isinstance(architect[key], str) and architect[key] == '＊＊＊':
-                                architect[key] = ''
-                        
-                        if architect.get('architect_name') and architect['architect_name'] != '':
-                            architects.append(architect)
-                            print(f"    ✓ 所属建築士: {architect['architect_name']} ({architect['architect_category']})")
+                        if name_kanji:
+                            affiliate_architects.append(architect)
+                            print(f"    ✓ 所属: {name_kanji}")
                     except Exception as e:
-                        print(f"    ⚠️ 所属建築士の抽出エラー: {str(e)}")
+                        print(f"    ⚠️ エラー: {str(e)}")
                         continue
     
-    # タブを閉じる
     driver.close()
-    
-    # 元のタブに戻る
     driver.switch_to.window(driver.window_handles[0])
     
-    print(f"  ✅ {len(architects)}人の建築士情報を取得")
-    
-    return architects
+    return {
+        'office_info': office_info,
+        'managing_architect': managing_architect,
+        'affiliate_architects': affiliate_architects
+    }
 
 def main():
     """メイン処理"""
@@ -211,16 +294,13 @@ def main():
     print("🚀 建築士事務所スクレイピング開始")
     print("=" * 60)
     
-    # DB初期化
     init_db()
-    
     driver = create_driver()
     
     try:
         target_url = "https://icba.kenchikugyousei-db.jp/knjt01/jimusho?sortCol=rec_no"
         search_number = "1"
         
-        # 1. 検索して詳細ページのリンクを全て取得
         print("\n【ステップ1】検索実行")
         detail_links = search_and_get_links(driver, target_url, search_number)
         
@@ -228,22 +308,25 @@ def main():
             print("❌ リンクが見つかりませんでした")
             return
         
-        # 2. 各詳細ページを順番に処理
         print(f"\n【ステップ2】詳細ページ処理（{len(detail_links)}件）")
         
         new_count = 0
         update_count = 0
         skip_count = 0
-        error_count = 0
         
         for i, link in enumerate(detail_links, 1):
-            print(f"\n[{i}/{len(detail_links)}] 処理中...")
+            print(f"\n[{i}/{len(detail_links)}]")
             
             try:
-                architects = scrape_detail_page(driver, link)
+                data = scrape_detail_page(driver, link)
                 
-                for architect in architects:
-                    result = insert_or_update_architect(architect)
+                office_info = data['office_info']
+                managing_architect = data['managing_architect']
+                affiliate_architects = data['affiliate_architects']
+                
+                # 管理建築士を1行として登録
+                if managing_architect and managing_architect.get('建築士氏名'):
+                    result = insert_architect_row(office_info, managing_architect, "管理建築士情報")
                     
                     if "新規登録" in result:
                         new_count += 1
@@ -254,29 +337,35 @@ def main():
                     
                     print(f"    💾 {result}")
                 
-                time.sleep(2)  # サーバー負荷軽減
+                # 所属建築士を1人ずつ1行として登録
+                for affiliate in affiliate_architects:
+                    result = insert_architect_row(office_info, affiliate, "所属建築士情報")
+                    
+                    if "新規登録" in result:
+                        new_count += 1
+                    elif "更新" in result:
+                        update_count += 1
+                    elif "スキップ" in result:
+                        skip_count += 1
+                    
+                    print(f"    💾 {result}")
+                
+                time.sleep(2)
                 
             except Exception as e:
-                error_count += 1
                 print(f"    ❌ エラー: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                # エラーが起きても続行
                 continue
         
-        # 3. 結果サマリー
         print("\n" + "=" * 60)
         print("📊 処理結果サマリー")
         print("=" * 60)
-        print(f"新規登録: {new_count}人")
-        print(f"更新: {update_count}人")
-        print(f"スキップ（重複）: {skip_count}人")
-        print(f"エラー: {error_count}件")
-        print(f"合計処理: {new_count + update_count + skip_count}人")
+        print(f"  新規: {new_count}人 / 更新: {update_count}人")
+        print(f"  スキップ: {skip_count}件")
         
-        # 4. CSVエクスポート
-        print("\n【ステップ3】CSVエクスポート")
-        export_to_csv("architects_export.csv")
+        print("\n【ステップ3】Excelエクスポート")
+        export_to_excel("architects_export.xlsx")
         
         print("\n✅ 全ての処理が完了しました！")
         
