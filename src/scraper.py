@@ -7,13 +7,63 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import time
 import re
+import json
+import os
 from bs4 import BeautifulSoup
 from database import init_db, insert_architect_row, export_to_excel
 
+# 設定定数
+START_NUMBER = 1                    # 検索開始番号
+END_NUMBER = 999999                 # 検索終了番号
+MAX_CONSECUTIVE_SKIPS = 10000      # 連続スキップの最大回数
+
+PROGRESS_FILE = "scraping_progress.json"
+
+def save_progress(current_number: int, consecutive_skips: int = 0):
+    with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+        json.dump({
+            'last_completed': current_number,
+            'consecutive_skips': consecutive_skips
+        }, f)
+    print(f"    💾 進捗を保存しました: 第{current_number}号まで完了 (連続スキップ: {consecutive_skips}回)")
+
+def load_progress() -> tuple:
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('last_completed', 0), data.get('consecutive_skips', 0)
+        except:
+            return 0, 0
+    return 0, 0
+
+def clear_progress():
+    if os.path.exists(PROGRESS_FILE):
+        os.remove(PROGRESS_FILE)
+        print("✅ 進捗ファイルをクリアしました")
+
+def normalize_text(text: str) -> str:
+    """全角数字を半角に変換、建築士登録番号から「第」と「号」を削除"""
+    if not text:
+        return text
+    
+    text = text.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+    text = re.sub(r'^第(.+?)号$', r'\1', text)
+    
+    return text
+
+def normalize_architect_data(data: dict) -> dict:
+    normalized = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            normalized[key] = normalize_text(value)
+        else:
+            normalized[key] = value
+    return normalized
+
 def create_driver():
-    """Chromeドライバーを作成"""
     chrome_options = Options()
-    # chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -25,7 +75,6 @@ def create_driver():
     )
 
 def search_and_get_links(driver, url: str, search_number: str) -> list:
-    """検索して詳細ページのリンクを全て取得"""
     driver.get(url)
     print("📄 ページを読み込み中...")
     time.sleep(3)
@@ -63,29 +112,22 @@ def search_and_get_links(driver, url: str, search_number: str) -> list:
     return links
 
 def extract_text_from_section(soup, section_title: str) -> str:
-    """セクションタイトルから対応するテキストを抽出"""
     try:
         li_elements = soup.find_all('li', class_='py-2')
         
         for li_elem in li_elements:
-            # h3タグを探す
             h3_elem = li_elem.find('h3', class_='text-sm')
             if h3_elem:
                 h3_text = h3_elem.get_text(strip=True)
                 
-                # 完全一致のみ（部分一致を除外）
                 if section_title == h3_text:
-                    # 同じli内のすべてのpタグを取得
                     p_tags = li_elem.find_all('p')
                     
-                    # pタグの中身を確認
                     for p_tag in p_tags:
                         text = p_tag.get_text(strip=True)
-                        # 空白文字のみスキップ
                         if text and text != '　':
                             return text
                     
-                    # pタグがない場合
                     return ''
     except Exception as e:
         print(f"      ⚠️ extract エラー ({section_title}): {str(e)}")
@@ -94,7 +136,6 @@ def extract_text_from_section(soup, section_title: str) -> str:
     return ''
 
 def extract_name_from_cell(cell):
-    """氏名セルからカナと漢字を抽出"""
     html = str(cell)
     parts = re.split(r'<br\s*/?>', html, flags=re.IGNORECASE)
     
@@ -112,14 +153,12 @@ def extract_name_from_cell(cell):
         return '', ''
 
 def scrape_detail_page(driver, url: str) -> dict:
-    """詳細ページをスクレイピングして情報を取得"""
     print(f"  📖 {url} を開いています...")
     
     driver.execute_script(f"window.open('{url}', '_blank');")
     driver.switch_to.window(driver.window_handles[-1])
     time.sleep(5)
     
-    # まず確実にtab1をクリックしてページ全体を読み込む
     try:
         driver.execute_script("document.querySelector('a[href=\"#tab1\"]').click();")
         time.sleep(3)
@@ -133,17 +172,6 @@ def scrape_detail_page(driver, url: str) -> dict:
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     tab1 = soup.find('div', id='tab1') or soup
     
-    # デバッグ用：HTMLの一部を出力
-    print("    🔍 HTMLデバッグ:")
-    li_elements = tab1.find_all('li', class_='py-2')
-    for li in li_elements:
-        h3 = li.find('h3')
-        p = li.find('p')
-        if h3 and '事務所所在地' in h3.get_text():
-            h3_text = h3.get_text(strip=True)
-            p_text = p.get_text(strip=True) if p else 'なし'
-            print(f"       {h3_text}: {p_text}")
-    
     office_info = {
         '事務所登録番号': extract_text_from_section(tab1, '事務所登録番号'),
         '事務所資格区分': extract_text_from_section(tab1, '事務所資格区分'),
@@ -154,15 +182,6 @@ def scrape_detail_page(driver, url: str) -> dict:
         '事務所電話番号': extract_text_from_section(tab1, '事務所電話番号'),
     }
     
-    # デバッグ出力
-    print(f"    📝 取得データ:")
-    print(f"       登録番号: {office_info['事務所登録番号']}")
-    print(f"       郵便番号: {office_info['事務所所在地郵便番号']}")
-    print(f"       所在地: {office_info['事務所所在地']}")
-    print(f"       ビル名: {office_info['事務所所在地ビル名等']}")
-    print(f"       電話: {office_info['事務所電話番号']}")
-    
-    # tab2（申請者情報）
     try:
         driver.execute_script("document.querySelector('a[href=\"#tab2\"]').click();")
         time.sleep(2)
@@ -173,12 +192,13 @@ def scrape_detail_page(driver, url: str) -> dict:
     tab2 = soup.find('div', id='tab2') or soup
     office_info['法人名称'] = extract_text_from_section(tab2, '法人名称')
     
+    office_info = normalize_architect_data(office_info)
+    
     print(f"    🏢 {office_info['事務所名称']}")
     
-    # tab4（管理建築士情報）
     try:
         driver.execute_script("document.querySelector('a[href=\"#tab4\"]').click();")
-        time.sleep(3)  # 待機時間を延長
+        time.sleep(3)
         driver.execute_script("window.scrollTo(0, 500);")
         time.sleep(1)
         driver.execute_script("window.scrollTo(0, 0);")
@@ -186,7 +206,6 @@ def scrape_detail_page(driver, url: str) -> dict:
     except:
         pass
     
-    # tab4のHTMLを再取得
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     tab4 = soup.find('div', id='tab4')
     
@@ -201,13 +220,14 @@ def scrape_detail_page(driver, url: str) -> dict:
             '登録を受けた都道府県名': extract_text_from_section(tab4, '登録を受けた都道府県名'),
         })
         
+        managing_architect = normalize_architect_data(managing_architect)
+        
         if managing_architect.get('建築士氏名'):
             print(f"    ✓ 管理: {managing_architect['建築士氏名']} ({managing_architect.get('建築士登録番号', '')})")
     
-    # tab5（所属建築士情報）
     try:
         driver.execute_script("document.querySelector('a[href=\"#tab5\"]').click();")
-        time.sleep(3)  # 待機時間を延長
+        time.sleep(3)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         driver.execute_script("window.scrollTo(0, 0);")
@@ -215,7 +235,6 @@ def scrape_detail_page(driver, url: str) -> dict:
     except:
         pass
     
-    # tab5のHTMLを再取得
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     tab5 = soup.find('div', id='tab5')
     
@@ -272,9 +291,11 @@ def scrape_detail_page(driver, url: str) -> dict:
                             '登録を受けた都道府県名': registration_pref,
                         })
                         
+                        architect = normalize_architect_data(architect)
+                        
                         if name_kanji:
                             affiliate_architects.append(architect)
-                            print(f"    ✓ 所属: {name_kanji}")
+                            print(f"    ✓ 所属: {name_kanji} ({architect.get('建築士登録番号', '')})")
                     except Exception as e:
                         print(f"    ⚠️ エラー: {str(e)}")
                         continue
@@ -289,83 +310,131 @@ def scrape_detail_page(driver, url: str) -> dict:
     }
 
 def main():
-    """メイン処理"""
     print("=" * 60)
     print("🚀 建築士事務所スクレイピング開始")
     print("=" * 60)
+    print(f"\n【設定】")
+    print(f"  開始番号: {START_NUMBER}")
+    print(f"  終了番号: {END_NUMBER}")
+    print(f"  最大連続スキップ回数: {MAX_CONSECUTIVE_SKIPS}")
+    
+    last_completed, consecutive_skips = load_progress()
+    
+    start_num = START_NUMBER
+    current_skips = 0
+    
+    if last_completed > 0:
+        print(f"\n⚠️  前回は第{last_completed}号まで完了しています（連続スキップ: {consecutive_skips}回）")
+        response = input(f"続きから開始しますか？ (y/n): ").strip().lower()
+        if response == 'y':
+            start_num = last_completed + 1
+            current_skips = consecutive_skips
+            print(f"✅ 第{start_num}号から再開します")
+        else:
+            clear_progress()
+            print(f"✅ 最初から開始します")
     
     init_db()
     driver = create_driver()
     
     try:
         target_url = "https://icba.kenchikugyousei-db.jp/knjt01/jimusho?sortCol=rec_no"
-        search_number = "1"
         
-        print("\n【ステップ1】検索実行")
-        detail_links = search_and_get_links(driver, target_url, search_number)
-        
-        if not detail_links:
-            print("❌ リンクが見つかりませんでした")
-            return
-        
-        print(f"\n【ステップ2】詳細ページ処理（{len(detail_links)}件）")
+        print(f"\n【検索範囲】第{start_num}号 ～ 第{END_NUMBER}号")
         
         new_count = 0
-        update_count = 0
-        skip_count = 0
+        duplicate_count = 0
+        total_processed = 0
         
-        for i, link in enumerate(detail_links, 1):
-            print(f"\n[{i}/{len(detail_links)}]")
+        for search_num in range(start_num, END_NUMBER + 1):
+            if current_skips >= MAX_CONSECUTIVE_SKIPS:
+                print(f"\n⚠️ 連続で{MAX_CONSECUTIVE_SKIPS}回データが見つかりませんでした")
+                print(f"💡 検索を終了します（最終検索番号: 第{search_num - 1}号）")
+                break
+            
+            print(f"\n" + "=" * 60)
+            print(f"【検索番号: 第{search_num}号】（連続スキップ: {current_skips}/{MAX_CONSECUTIVE_SKIPS}）")
+            print("=" * 60)
             
             try:
-                data = scrape_detail_page(driver, link)
+                detail_links = search_and_get_links(driver, target_url, str(search_num))
                 
-                office_info = data['office_info']
-                managing_architect = data['managing_architect']
-                affiliate_architects = data['affiliate_architects']
+                if not detail_links:
+                    print(f"❌ 第{search_num}号: リンクが見つかりませんでした")
+                    current_skips += 1
+                    save_progress(search_num, current_skips)
+                    continue
                 
-                # 管理建築士を1行として登録
-                if managing_architect and managing_architect.get('建築士氏名'):
-                    result = insert_architect_row(office_info, managing_architect, "管理建築士情報")
-                    
-                    if "新規登録" in result:
-                        new_count += 1
-                    elif "更新" in result:
-                        update_count += 1
-                    elif "スキップ" in result:
-                        skip_count += 1
-                    
-                    print(f"    💾 {result}")
+                if current_skips > 0:
+                    print(f"✅ データが見つかりました！連続スキップカウントをリセットします（{current_skips} → 0）")
+                    current_skips = 0
                 
-                # 所属建築士を1人ずつ1行として登録
-                for affiliate in affiliate_architects:
-                    result = insert_architect_row(office_info, affiliate, "所属建築士情報")
-                    
-                    if "新規登録" in result:
-                        new_count += 1
-                    elif "更新" in result:
-                        update_count += 1
-                    elif "スキップ" in result:
-                        skip_count += 1
-                    
-                    print(f"    💾 {result}")
+                print(f"\n【詳細ページ処理】({len(detail_links)}件)")
                 
-                time.sleep(2)
+                for i, link in enumerate(detail_links, 1):
+                    print(f"\n[{i}/{len(detail_links)}]")
+                    
+                    try:
+                        data = scrape_detail_page(driver, link)
+                        
+                        office_info = data['office_info']
+                        managing_architect = data['managing_architect']
+                        affiliate_architects = data['affiliate_architects']
+                        
+                        if managing_architect and managing_architect.get('建築士氏名'):
+                            result = insert_architect_row(office_info, managing_architect, "管理建築士情報")
+                            
+                            if "新規登録" in result:
+                                new_count += 1
+                            elif "重複" in result:
+                                duplicate_count += 1
+                            
+                            total_processed += 1
+                            print(f"    💾 {result}")
+                        
+                        for affiliate in affiliate_architects:
+                            result = insert_architect_row(office_info, affiliate, "所属建築士情報")
+                            
+                            if "新規登録" in result:
+                                new_count += 1
+                            elif "重複" in result:
+                                duplicate_count += 1
+                            
+                            total_processed += 1
+                            print(f"    💾 {result}")
+                        
+                        time.sleep(2)
+                        
+                    except Exception as e:
+                        print(f"    ❌ エラー: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                
+                save_progress(search_num, current_skips)
                 
             except Exception as e:
-                print(f"    ❌ エラー: {str(e)}")
+                print(f"❌ 第{search_num}号の処理中にエラー: {str(e)}")
                 import traceback
                 traceback.print_exc()
+                current_skips += 1
+                save_progress(search_num, current_skips)
                 continue
         
         print("\n" + "=" * 60)
         print("📊 処理結果サマリー")
         print("=" * 60)
-        print(f"  新規: {new_count}人 / 更新: {update_count}人")
-        print(f"  スキップ: {skip_count}件")
+        print(f"  検索範囲: 第{start_num}号 ～ 第{search_num}号")
+        print(f"  処理件数: {total_processed}人")
+        print(f"  新規登録: {new_count}人")
+        print(f"  重複登録: {duplicate_count}人")
+        print(f"  最終連続スキップ: {current_skips}回")
         
-        print("\n【ステップ3】Excelエクスポート")
+        print("\n【Excelファイル情報】")
         export_to_excel("architects_export.xlsx")
+        
+        if current_skips >= MAX_CONSECUTIVE_SKIPS or search_num >= END_NUMBER:
+            clear_progress()
         
         print("\n✅ 全ての処理が完了しました！")
         
