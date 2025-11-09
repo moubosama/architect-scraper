@@ -10,7 +10,7 @@ import re
 import json
 import os
 from bs4 import BeautifulSoup
-from database import init_db, insert_architect_row, export_to_excel
+from database import init_db, insert_architect_row, insert_summary_history, export_to_excel, get_excel_filename
 
 # 設定定数
 START_NUMBER = 1                    # 検索開始番号
@@ -180,6 +180,7 @@ def scrape_detail_page(driver, url: str) -> dict:
         '事務所所在地': extract_text_from_section(tab1, '事務所所在地'),
         '事務所所在地ビル名等': extract_text_from_section(tab1, '事務所所在地ビル名等'),
         '事務所電話番号': extract_text_from_section(tab1, '事務所電話番号'),
+        '登録都道府県': extract_text_from_section(tab1, '登録都道府県'),
     }
     
     try:
@@ -317,6 +318,7 @@ def main():
     print(f"  開始番号: {START_NUMBER}")
     print(f"  終了番号: {END_NUMBER}")
     print(f"  最大連続スキップ回数: {MAX_CONSECUTIVE_SKIPS}")
+    print(f"  Excelファイル名: {get_excel_filename()}")
     
     last_completed, consecutive_skips = load_progress()
     
@@ -344,6 +346,8 @@ def main():
         
         new_count = 0
         duplicate_count = 0
+        affiliation_count = 0
+        office_dup_count = 0
         total_processed = 0
         
         for search_num in range(start_num, END_NUMBER + 1):
@@ -381,15 +385,23 @@ def main():
                         managing_architect = data['managing_architect']
                         affiliate_architects = data['affiliate_architects']
                         
+                        # この事務所で登録した建築士の人数をカウント
+                        office_architect_count = 0
+                        
                         if managing_architect and managing_architect.get('建築士氏名'):
                             result = insert_architect_row(office_info, managing_architect, "管理建築士情報")
                             
                             if "新規登録" in result:
                                 new_count += 1
-                            elif "重複" in result:
+                            elif "完全重複" in result:
                                 duplicate_count += 1
+                            elif "所属重複" in result:
+                                affiliation_count += 1
+                            elif "事務所重複" in result:
+                                office_dup_count += 1
                             
                             total_processed += 1
+                            office_architect_count += 1
                             print(f"    💾 {result}")
                         
                         for affiliate in affiliate_architects:
@@ -397,11 +409,24 @@ def main():
                             
                             if "新規登録" in result:
                                 new_count += 1
-                            elif "重複" in result:
+                            elif "完全重複" in result:
                                 duplicate_count += 1
+                            elif "所属重複" in result:
+                                affiliation_count += 1
+                            elif "事務所重複" in result:
+                                office_dup_count += 1
                             
                             total_processed += 1
+                            office_architect_count += 1
                             print(f"    💾 {result}")
+                        
+                        # summary_historyに記録
+                        if office_architect_count > 0:
+                            insert_summary_history(
+                                office_info.get('事務所登録番号', ''),
+                                office_info.get('登録都道府県', ''),
+                                office_architect_count
+                            )
                         
                         time.sleep(2)
                         
@@ -427,11 +452,13 @@ def main():
         print(f"  検索範囲: 第{start_num}号 ～ 第{search_num}号")
         print(f"  処理件数: {total_processed}人")
         print(f"  新規登録: {new_count}人")
-        print(f"  重複登録: {duplicate_count}人")
+        print(f"  完全重複: {duplicate_count}人")
+        print(f"  所属重複: {affiliation_count}人")
+        print(f"  事務所重複: {office_dup_count}人")
         print(f"  最終連続スキップ: {current_skips}回")
         
         print("\n【Excelファイル情報】")
-        export_to_excel("architects_export.xlsx")
+        export_to_excel()
         
         if current_skips >= MAX_CONSECUTIVE_SKIPS or search_num >= END_NUMBER:
             clear_progress()
